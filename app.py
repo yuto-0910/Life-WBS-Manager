@@ -91,12 +91,15 @@ def calculate_valuation(age: int, wins: int) -> dict:
     }
 
 
-def generate_initial_wbs(age: int, wins: int, valuation: dict) -> pd.DataFrame:
+def generate_initial_wbs(
+    age: int, wins: int, valuation: dict, win_details: list[str] = None
+) -> pd.DataFrame:
     """
     初期WBS行（Genesis Row）を生成
     - Row 1: ルートプロジェクト（基本資本100億円）
     - Row 1.1: 過去の時間コスト（マイナス）
-    - Row 1.2: のれん代（プラス）※挑戦回数 > 0 の場合のみ
+    - Row 1.2: のれん代サマリー（プラス）※挑戦回数 > 0 の場合のみ
+    - Row 1.2.x: 各挑戦の詳細行（PL=0、内訳表示用）
     - Row 2: 現年度フェーズ（月次アクションの親）
     """
     year = datetime.now().year
@@ -131,6 +134,18 @@ def generate_initial_wbs(age: int, wins: int, valuation: dict) -> pd.DataFrame:
             "Memo": f"{wins}回の挑戦 × 3.6億円",
         })
 
+        # 各挑戦の詳細行（内訳表示用、PL=0で合計に影響しない）
+        if win_details:
+            for i, detail in enumerate(win_details, start=1):
+                rows.append({
+                    "ID": f"1.2.{i}",
+                    "Parent": "1.2",
+                    "Task": detail,
+                    "Status": "Bonus",
+                    "PL": 0,
+                    "Memo": f"挑戦 #{i}",
+                })
+
     # 現年度フェーズ（月次アクションの格納先）
     rows.append({
         "ID": "2",
@@ -146,7 +161,17 @@ def generate_initial_wbs(age: int, wins: int, valuation: dict) -> pd.DataFrame:
     return df
 
 
-def get_next_action_id(df: pd.DataFrame, parent_id: str = "2") -> str:
+def sort_wbs(df: pd.DataFrame) -> pd.DataFrame:
+    """WBS IDの階層順（1, 1.1, 1.2, 2, 2.1, ...）でDataFrameをソート"""
+    df = df.copy()
+    df["_sort_key"] = df["ID"].apply(
+        lambda x: tuple(int(n) for n in x.split("."))
+    )
+    df = df.sort_values("_sort_key").drop(columns="_sort_key").reset_index(drop=True)
+    return df
+
+
+def get_next_action_id(df: pd.DataFrame, parent_id: str) -> str:
     """
     次のアクションIDを自動採番
     親ID配下の子タスク数をカウントし、ParentID.連番 を返す
@@ -156,16 +181,56 @@ def get_next_action_id(df: pd.DataFrame, parent_id: str = "2") -> str:
     return f"{parent_id}.{next_num}"
 
 
+def get_phase_ids(df: pd.DataFrame) -> list[str]:
+    """年度フェーズ（Parent="0" かつ ID≠"1"）のID一覧を返す"""
+    phases = df[(df["Parent"] == "0") & (df["ID"] != "1")]
+    return phases["ID"].tolist()
+
+
+def find_or_create_year_phase(df: pd.DataFrame, year: int) -> tuple:
+    """
+    指定された年のフェーズ行を探す。なければ新規作成してDataFrameに追加する。
+    戻り値: (更新後のDataFrame, 該当フェーズのID)
+    """
+    phase_name = f"FY{year}"
+
+    # 既存フェーズからタスク名で検索
+    match = df[df["Task"] == phase_name]
+    if not match.empty:
+        return df, match.iloc[0]["ID"]
+
+    # 新規フェーズID = 既存のルート直下IDの最大値 + 1
+    root_children = df[df["Parent"] == "0"]
+    max_id = max(int(row["ID"]) for _, row in root_children.iterrows())
+    new_phase_id = str(max_id + 1)
+
+    new_phase = pd.DataFrame([{
+        "ID": new_phase_id,
+        "Parent": "0",
+        "Task": phase_name,
+        "Status": "In Progress",
+        "PL": 0,
+        "Memo": f"{year}年度",
+    }])
+    df = pd.concat([df, new_phase], ignore_index=True)
+    df["PL"] = df["PL"].astype(int)
+    df = sort_wbs(df)
+
+    return df, new_phase_id
+
+
 def calculate_kpis(df: pd.DataFrame) -> dict:
     """
     KPI（主要業績指標）を計算
     - 現在資産: 全行のPL合計
     - 累計損失: PLがマイナスの行の合計（絶対値表示用）
-    - アクション数: Phase 2 の子タスク数
+    - アクション数: 全年度フェーズ配下の子タスク数
     """
     current_asset = int(df["PL"].sum())
     total_loss = int(df[df["PL"] < 0]["PL"].sum())
-    action_count = len(df[df["Parent"] == "2"])
+    # 全年度フェーズ配下のアクション数を合計
+    phase_ids = get_phase_ids(df)
+    action_count = len(df[df["Parent"].isin(phase_ids)])
 
     return {
         "current_asset": current_asset,
@@ -189,6 +254,16 @@ st.set_page_config(
     page_title="Life WBS Manager",
     page_icon="📊",
     layout="wide",
+    menu_items={
+        "Get help": None,
+        "Report a Bug": None,
+        "About": (
+            "### Life WBS Manager\n"
+            "「平均的に過ごすことは、毎月1000万円の罰金である」\n\n"
+            "人生を100億円の巨大プロジェクトと定義し、"
+            "現状維持による機会損失を可視化する行動喚起型予実管理ツール。"
+        ),
+    },
 )
 
 # ========================================
@@ -202,7 +277,9 @@ if "wbs_data" not in st.session_state:
 # サイドバー
 # ========================================
 with st.sidebar:
-    st.title("Life WBS Manager")
+    if st.button("Life WBS Manager", type="tertiary", use_container_width=True):
+        st.session_state.wbs_data = None
+        st.rerun()
     st.caption("「平均的に過ごすことは、毎月1000万円の罰金である」")
     st.divider()
 
@@ -259,41 +336,58 @@ if st.session_state.wbs_data is None:
             "+ のれん代(挑戦数 × 3.6億)"
         )
 
-        with st.form("onboarding_form"):
-            col_age, col_wins = st.columns(2)
+        # Step 1: 基本情報（フォーム外で動的UI更新を可能にする）
+        col_age, col_wins = st.columns(2)
 
-            with col_age:
-                age = st.number_input(
-                    "現在の年齢",
-                    min_value=1,
-                    max_value=120,
-                    value=30,
-                    step=1,
-                )
-            with col_wins:
-                wins = st.number_input(
-                    "過去の大きな挑戦の回数",
-                    min_value=0,
-                    max_value=100,
-                    value=0,
-                    step=1,
-                    help="転職・起業・海外移住・受賞など、人生のステージが変わった回数",
-                )
+        with col_age:
+            age = st.number_input(
+                "現在の年齢",
+                min_value=1,
+                max_value=120,
+                value=30,
+                step=1,
+            )
+        with col_wins:
+            wins = st.number_input(
+                "過去の大きな挑戦の回数",
+                min_value=0,
+                max_value=100,
+                value=0,
+                step=1,
+                help="転職・起業・海外移住・受賞など、人生のステージが変わった回数",
+            )
 
-            # 事前プレビュー計算
-            preview_val = calculate_valuation(age, wins)
+        # Step 2: 挑戦の詳細入力（回数に応じて動的に入力欄を表示）
+        win_details = []
+        if wins > 0:
             st.markdown("---")
-            st.markdown("**査定プレビュー**")
-            pc1, pc2, pc3 = st.columns(3)
-            pc1.metric("時間コスト", format_yen_readable(preview_val["depreciation"]))
-            pc2.metric("のれん代", format_yen_readable(preview_val["goodwill"]))
-            pc3.metric("開始資産", format_yen_readable(preview_val["initial_asset"]))
+            st.markdown("**過去の挑戦の内容を記入してください**")
+            for i in range(1, wins + 1):
+                detail = st.text_input(
+                    f"挑戦 #{i}",
+                    placeholder="例: 海外転職、起業、資格取得など",
+                    key=f"win_detail_{i}",
+                )
+                win_details.append(detail)
 
-            submitted = st.form_submit_button("プロジェクトを開始する", type="primary")
+        # 査定プレビュー
+        preview_val = calculate_valuation(age, wins)
+        st.markdown("---")
+        st.markdown("**査定プレビュー**")
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("時間コスト", format_yen_readable(preview_val["depreciation"]))
+        pc2.metric("のれん代", format_yen_readable(preview_val["goodwill"]))
+        pc3.metric("開始資産", format_yen_readable(preview_val["initial_asset"]))
 
-        if submitted:
+        # 開始ボタン
+        if st.button("プロジェクトを開始する", type="primary"):
+            # 未入力の挑戦は「挑戦 #N」をデフォルト名にする
+            filled_details = []
+            for i, d in enumerate(win_details, start=1):
+                filled_details.append(d.strip() if d and d.strip() else f"挑戦 #{i}")
+
             valuation = calculate_valuation(age, wins)
-            df = generate_initial_wbs(age, wins, valuation)
+            df = generate_initial_wbs(age, wins, valuation, filled_details)
             st.session_state.wbs_data = df
             st.rerun()
 
@@ -330,13 +424,49 @@ else:
     df = st.session_state.wbs_data
     kpis = calculate_kpis(df)
 
+    # --- 残り人生ゲージ ---
+    asset = kpis["current_asset"]
+    pct = max(0, min(100, asset / INITIAL_CAPITAL * 100))
+
+    # 残高に応じたゲージ色
+    if asset < 0:
+        bar_color = "#FF0000"
+        status_text = "破産"
+    elif asset < 3_000_000_000:
+        bar_color = "#FF4B4B"
+        status_text = "危険水域"
+    elif asset < 5_000_000_000:
+        bar_color = "#FFA500"
+        status_text = "注意"
+    else:
+        bar_color = "#00CC66"
+        status_text = "健全"
+
+    st.markdown(
+        f"""
+        <div style="margin-bottom:4px; display:flex; justify-content:space-between; font-size:14px;">
+            <span>残り人生資産 — <b>{status_text}</b></span>
+            <span><b>{format_yen_readable(asset)}</b> / {format_yen_readable(INITIAL_CAPITAL)}</span>
+        </div>
+        <div style="background:#333; border-radius:8px; height:28px; width:100%; overflow:hidden;">
+            <div style="background:{bar_color}; width:{pct:.1f}%; height:100%; border-radius:8px;
+                        display:flex; align-items:center; justify-content:center;
+                        color:#fff; font-weight:bold; font-size:13px; min-width:40px;">
+                {pct:.0f}%
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("")  # スペーサー
+
     # --- アラート判定 ---
-    if kpis["current_asset"] < 0:
+    if asset < 0:
         st.error(
             "🚨 **破産（Bankruptcy）** — "
             "資産残高がマイナスに転落しました。直ちに行動を変えてください。"
         )
-    elif kpis["current_asset"] < 3_000_000_000:
+    elif asset < 3_000_000_000:
         st.warning(
             "⚠️ **危険水域（Critical）** — "
             "資産残高が30億円を下回りました。猶予はわずかです。"
@@ -353,8 +483,8 @@ else:
     # --- 月次アクション記録フォーム ---
     st.subheader("月次アクション記録")
 
-    # Phase 2（現年度フェーズ）の存在確認
-    if not df[df["ID"] == "2"].empty:
+    # 年度フェーズの存在確認（ID≠"1"でParent="0"のフェーズが1つ以上あること）
+    if get_phase_ids(df):
 
         with st.form("action_form", clear_on_submit=True):
             form_c1, form_c2 = st.columns(2)
@@ -399,33 +529,34 @@ else:
                 selected_status = STATUS_LABELS[status_label]
                 pl_value = STATUS_PL_MAP[selected_status]
 
-                # ID採番
-                new_id = get_next_action_id(df)
+                # 対象年度のフェーズを取得（なければ自動作成）
+                action_year = action_date.year
+                df, phase_id = find_or_create_year_phase(df, action_year)
+
+                # ID採番（該当年度フェーズ配下）
+                new_id = get_next_action_id(df, phase_id)
                 date_str = action_date.strftime("%Y-%m")
 
                 # 新規行の作成
                 new_row = pd.DataFrame([{
                     "ID": new_id,
-                    "Parent": "2",
+                    "Parent": phase_id,
                     "Task": f"{date_str} {task_name.strip()}",
                     "Status": selected_status,
                     "PL": pl_value,
                     "Memo": memo if memo else "",
                 }])
 
-                # DataFrameに追加してセッション更新
-                st.session_state.wbs_data = pd.concat(
-                    [df, new_row], ignore_index=True
-                )
-                st.session_state.wbs_data["PL"] = (
-                    st.session_state.wbs_data["PL"].astype(int)
-                )
+                # DataFrameに追加・ソートしてセッション更新
+                updated = pd.concat([df, new_row], ignore_index=True)
+                updated["PL"] = updated["PL"].astype(int)
+                st.session_state.wbs_data = sort_wbs(updated)
                 st.rerun()
 
     else:
         st.warning(
-            "現年度フェーズ（ID: 2）が見つかりません。"
-            "CSVデータにフェーズ行が含まれていることを確認してください。"
+            "年度フェーズが見つかりません。"
+            "CSVデータにFY行（Parent=0）が含まれていることを確認してください。"
         )
 
     st.divider()
@@ -468,3 +599,74 @@ else:
         use_container_width=True,
         hide_index=True,
     )
+
+    # --- 既存行の編集 ---
+    # 編集対象: 全年度フェーズ配下のアクション行
+    phase_ids = get_phase_ids(df)
+    action_rows = df[df["Parent"].isin(phase_ids)]
+
+    if not action_rows.empty:
+        st.divider()
+        st.subheader("既存アクションの編集")
+
+        # 内部ステータスID → UI表示ラベルの逆引き
+        STATUS_LABELS_REV = {v: k for k, v in STATUS_LABELS.items()}
+
+        # 編集対象の選択肢を作成
+        edit_options = {
+            f"{row['ID']} | {row['Task']}": idx
+            for idx, row in action_rows.iterrows()
+        }
+        selected_label = st.selectbox(
+            "編集する行を選択",
+            options=list(edit_options.keys()),
+        )
+        selected_idx = edit_options[selected_label]
+        selected_row = df.loc[selected_idx]
+
+        with st.form("edit_form"):
+            ec1, ec2 = st.columns(2)
+
+            with ec1:
+                edit_task = st.text_input(
+                    "タスク名",
+                    value=selected_row["Task"],
+                )
+            with ec2:
+                # 現在のステータスをデフォルト選択にする
+                current_label = STATUS_LABELS_REV.get(
+                    selected_row["Status"], list(STATUS_LABELS.keys())[0]
+                )
+                label_list = list(STATUS_LABELS.keys())
+                edit_status = st.selectbox(
+                    "ステータス",
+                    options=label_list,
+                    index=label_list.index(current_label),
+                )
+
+            edit_memo = st.text_input(
+                "備考",
+                value=selected_row["Memo"] if pd.notna(selected_row["Memo"]) else "",
+            )
+
+            ec_btn1, ec_btn2 = st.columns(2)
+            with ec_btn1:
+                save_btn = st.form_submit_button("保存する", type="primary")
+            with ec_btn2:
+                delete_btn = st.form_submit_button("この行を削除する")
+
+        if save_btn:
+            if not edit_task or not edit_task.strip():
+                st.error("タスク名を入力してください。")
+            else:
+                new_status = STATUS_LABELS[edit_status]
+                new_pl = STATUS_PL_MAP[new_status]
+                st.session_state.wbs_data.at[selected_idx, "Task"] = edit_task.strip()
+                st.session_state.wbs_data.at[selected_idx, "Status"] = new_status
+                st.session_state.wbs_data.at[selected_idx, "PL"] = new_pl
+                st.session_state.wbs_data.at[selected_idx, "Memo"] = edit_memo
+                st.rerun()
+
+        if delete_btn:
+            st.session_state.wbs_data = sort_wbs(df.drop(index=selected_idx))
+            st.rerun()
